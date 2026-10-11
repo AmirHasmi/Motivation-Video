@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+output/
+music/*
+!music/.gitkeep
+.env
