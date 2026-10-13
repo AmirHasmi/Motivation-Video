@@ -1,0 +1,427 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Mootion API",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.seedv.cn"
+    }
+  ],
+  "paths": {
+    "/api/v1/text2video": {
+      "post": {
+        "tags": [
+          "Text to Video"
+        ],
+        "summary": "Create task",
+        "description": "Create async task for video generation in background",
+        "operationId": "new_api_v1_text2video_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Text2VideoTaskForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Return task ID and status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Text2VideoTaskSchema"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/text2video/{id}": {
+      "get": {
+        "tags": [
+          "Text to Video"
+        ],
+        "summary": "Get result",
+        "description": "Get the result by ID",
+        "operationId": "get_api_v1_text2video__id__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Return the task details including video URL and request ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Text2VideoTaskSchema"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CompositionForm": {
+        "properties": {
+          "video_config": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VideoConfig"
+              }
+            ],
+            "title": "",
+            "description": ""
+          },
+          "voice_config": {
+            "type": "string",
+            "title": "",
+            "description": "",
+            "default": "Ava"
+          }
+        },
+        "type": "object",
+        "title": "CompositionForm"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ProgressSchema": {
+        "properties": {
+          "current": {
+            "type": "integer",
+            "title": "Current"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "current",
+          "total"
+        ],
+        "title": "ProgressSchema"
+      },
+      "StoryboardForm": {
+        "properties": {
+          "style": {
+            "type": "string",
+            "title": "",
+            "description": "",
+            "default": "photorealistic"
+          },
+          "user_input": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UserInput"
+              }
+            ],
+            "title": "",
+            "description": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_input"
+        ],
+        "title": "StoryboardForm"
+      },
+      "TaskStatus": {
+        "type": "string",
+        "enum": [
+          "created",
+          "pending",
+          "processing",
+          "success",
+          "failure",
+          "cancelled"
+        ],
+        "title": "TaskStatus"
+      },
+      "Text2VideoDataSchema": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "create_time": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Create Time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProgressSchema"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "estimated_remaining_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Remaining Time"
+          },
+          "elapsed_total_time": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Elapsed Total Time"
+          },
+          "video_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Video Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "create_time",
+          "status",
+          "type",
+          "progress",
+          "failure_reason",
+          "estimated_remaining_time",
+          "elapsed_total_time",
+          "video_url"
+        ],
+        "title": "Text2VideoDataSchema"
+      },
+      "Text2VideoTaskForm": {
+        "properties": {
+          "size": {
+            "type": "string",
+            "enum": [
+              "1920x1080",
+              "1080x1920",
+              "1080x1080"
+            ],
+            "title": "",
+            "description": "",
+            "default": "1920x1080"
+          },
+          "storyboard": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StoryboardForm"
+              }
+            ],
+            "title": "",
+            "description": ""
+          },
+          "composition": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CompositionForm"
+              }
+            ],
+            "title": "",
+            "description": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "storyboard"
+        ],
+        "title": "Text2VideoTaskForm"
+      },
+      "Text2VideoTaskSchema": {
+        "properties": {
+          "code": {
+            "type": "integer",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Text2VideoDataSchema"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data"
+        ],
+        "title": "Text2VideoTaskSchema"
+      },
+      "UserInput": {
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "title": "",
+            "description": ""
+          },
+          "language": {
+            "type": "string",
+            "title": "",
+            "description": "",
+            "default": "en-US"
+          }
+        },
+        "type": "object",
+        "required": [
+          "prompt"
+        ],
+        "title": "UserInput"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "VideoConfig": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "",
+            "description": "",
+            "default": "Title_EN_Stroke_01"
+          },
+          "subtitle": {
+            "type": "string",
+            "title": "",
+            "description": "",
+            "default": "Subtitle_EN_Fill_01"
+          }
+        },
+        "type": "object",
+        "title": "VideoConfig"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}

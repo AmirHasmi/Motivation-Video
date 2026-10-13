@@ -2,7 +2,7 @@
 """Generate a motivational video.
 
 Pipeline:
-  1. Ask the Motion AI API to generate a cloud video clip (or use --clip).
+  1. Ask the Mootion API to generate a cloud video clip (or use --clip).
   2. Pick a random instrumental track from a music folder.
   3. Pick a random quote from a quotes file.
   4. Use FFmpeg to overlay the quote, add the music, and export the result.
@@ -31,7 +31,8 @@ from pathlib import Path
 log = logging.getLogger("motivation_video")
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
-DEFAULT_API_BASE = "https://api.motion.so/api/motion"
+DEFAULT_API_BASE = "https://api.seedv.cn"
+VIDEO_SIZES = ("1080x1920", "1920x1080", "1080x1080")
 DEFAULT_PROMPT = (
     "Cinematic time-lapse of soft white clouds drifting across a golden "
     "sunrise sky, slow camera push-in, peaceful and inspiring, no text"
@@ -44,9 +45,8 @@ FONT_CANDIDATES = [
     "C:/Windows/Fonts/arialbd.ttf",
 ]
 
-# Job status values treated as finished / failed. Compared case-insensitively.
-DONE_STATUSES = {"completed", "complete", "succeeded", "success", "done", "finished"}
-FAILED_STATUSES = {"failed", "error", "errored", "cancelled", "canceled", "rejected"}
+# Mootion TaskStatus: created, pending, processing, success, failure, cancelled.
+FAILED_STATUSES = {"failure", "cancelled"}
 
 
 class PipelineError(RuntimeError):
@@ -54,20 +54,21 @@ class PipelineError(RuntimeError):
 
 
 # --------------------------------------------------------------------------- #
-# Motion AI API client
+# Mootion API client (spec: docs/mootion-api.json)
 # --------------------------------------------------------------------------- #
 
 
-class MotionClient:
-    """Minimal client for the Motion AI video-generation API.
+class MootionClient:
+    """Minimal client for the Mootion text-to-video API.
 
-    Flow: POST {base}/sessions -> job id, poll GET {base}/sessions/{id}
-    until the job finishes, then download the MP4 it points to.
+    Flow: POST {base}/api/v1/text2video -> task id, poll
+    GET {base}/api/v1/text2video/{id} until status is "success", then
+    download data.video_url. Every response is {code, message, data}.
     """
 
     def __init__(self, api_key: str, base_url: str = DEFAULT_API_BASE, timeout: float = 60):
         if not api_key:
-            raise PipelineError("Motion AI API key missing: set MOTION_API_KEY or pass --api-key")
+            raise PipelineError("Mootion API key missing: set MOOTION_API_KEY or pass --api-key")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -86,49 +87,50 @@ class MotionClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode() or "{}")
+                payload = json.loads(resp.read().decode() or "{}")
         except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:500]
-            raise PipelineError(f"Motion AI {method} {path} failed: HTTP {e.code}: {detail}") from e
+            raise PipelineError(f"Mootion {method} {path} failed: HTTP {e.code}: {_error_detail(e)}") from e
         except urllib.error.URLError as e:
-            raise PipelineError(f"Motion AI {method} {path} failed: {e.reason}") from e
+            raise PipelineError(f"Mootion {method} {path} failed: {e.reason}") from e
+        task = payload.get("data")
+        if not isinstance(task, dict):
+            raise PipelineError(
+                f"Mootion {method} {path}: code={payload.get('code')} "
+                f"message={payload.get('message')!r}, no task data"
+            )
+        return task
 
-    def create_job(self, prompt: str, aspect_ratio: str, duration: int) -> str:
-        resp = self._request(
-            "POST",
-            "/sessions",
-            {"prompt": prompt, "aspect_ratio": aspect_ratio, "duration": duration},
-        )
-        job_id = _first(resp, "job_id", "id", "session_id") or _first(
-            resp.get("data") or {}, "job_id", "id", "session_id"
-        )
-        if not job_id:
-            raise PipelineError(f"Motion AI did not return a job id: {resp}")
-        return str(job_id)
+    def create_task(self, prompt: str, size: str, style: str, language: str) -> str:
+        task = self._request("POST", "/api/v1/text2video", {
+            "size": size,
+            "storyboard": {"style": style, "user_input": {"prompt": prompt, "language": language}},
+        })
+        if not task.get("id"):
+            raise PipelineError(f"Mootion did not return a task id: {task}")
+        return str(task["id"])
 
-    def get_job(self, job_id: str) -> dict:
-        return self._request("GET", f"/sessions/{job_id}")
+    def get_task(self, task_id: str) -> dict:
+        return self._request("GET", f"/api/v1/text2video/{task_id}")
 
-    def wait_for_video_url(self, job_id: str, poll_interval: float = 5, max_wait: float = 900) -> str:
+    def wait_for_video_url(self, task_id: str, poll_interval: float = 10, max_wait: float = 1800) -> str:
         deadline = time.monotonic() + max_wait
         while True:
-            job = self.get_job(job_id)
-            status = str(job_status(job)).lower()
-            log.info("Motion AI job %s status: %s", job_id, status or "unknown")
+            task = self.get_task(task_id)
+            status = task.get("status")
+            log.info("Mootion task %s: %s%s", task_id, status, _progress_note(task))
             if status in FAILED_STATUSES:
-                raise PipelineError(f"Motion AI job {job_id} {status}: {job.get('error') or job}")
-            url = job_video_url(job)
-            if url and (status in DONE_STATUSES or not status):
-                return url
-            if status in DONE_STATUSES:
-                raise PipelineError(f"Motion AI job {job_id} finished without a video URL: {job}")
+                raise PipelineError(f"Mootion task {task_id} {status}: {task.get('failure_reason')}")
+            if status == "success":
+                if not task.get("video_url"):
+                    raise PipelineError(f"Mootion task {task_id} succeeded without a video_url: {task}")
+                return task["video_url"]
             if time.monotonic() >= deadline:
-                raise PipelineError(f"Timed out after {max_wait}s waiting for Motion AI job {job_id}")
+                raise PipelineError(f"Timed out after {max_wait:.0f}s waiting for Mootion task {task_id}")
             time.sleep(poll_interval)
 
     def download(self, url: str, dest: Path) -> Path:
-        # Result URLs are usually pre-signed storage links; only send the key to our own API host.
-        headers = {"Authorization": f"Bearer {self.api_key}"} if url.startswith(self.base_url) else {}
+        # video_url is normally a storage link; only send the key to the API host itself.
+        headers = {"Authorization": f"Bearer {self.api_key}"} if url.startswith(self.base_url + "/") else {}
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp, open(dest, "wb") as f:
@@ -137,40 +139,38 @@ class MotionClient:
             raise PipelineError(f"Downloading generated clip failed: {e}") from e
         return dest
 
-    def generate_clip(self, prompt: str, aspect_ratio: str, duration: int, dest: Path,
-                      poll_interval: float = 5, max_wait: float = 900) -> Path:
-        job_id = self.create_job(prompt, aspect_ratio, duration)
-        log.info("Motion AI job created: %s", job_id)
-        url = self.wait_for_video_url(job_id, poll_interval, max_wait)
+    def generate_clip(self, prompt: str, size: str, style: str, language: str, dest: Path,
+                      poll_interval: float = 10, max_wait: float = 1800) -> Path:
+        task_id = self.create_task(prompt, size, style, language)
+        log.info("Mootion task created: %s", task_id)
+        url = self.wait_for_video_url(task_id, poll_interval, max_wait)
         log.info("Downloading generated clip")
         return self.download(url, dest)
 
 
-def _first(d: dict, *keys: str):
-    for k in keys:
-        if isinstance(d, dict) and d.get(k):
-            return d[k]
-    return None
+def _error_detail(e: urllib.error.HTTPError) -> str:
+    """Readable message from an error body, including FastAPI 422 validation errors."""
+    raw = e.read().decode(errors="replace")
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return raw[:500]
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, list):
+        return "; ".join(
+            f"{'.'.join(str(p) for p in d.get('loc', []))}: {d.get('msg')}" for d in detail if isinstance(d, dict)
+        )
+    return str(body.get("message") or detail or body)[:500] if isinstance(body, dict) else raw[:500]
 
 
-def job_status(job: dict) -> str:
-    return _first(job, "status", "state") or _first(job.get("data") or {}, "status", "state") or ""
-
-
-def job_video_url(job: dict) -> str | None:
-    """Find the finished video URL in a job response, tolerating a few shapes."""
-    for container in (job, job.get("data") or {}, job.get("result") or {}, job.get("output") or {}):
-        url = _first(container, "video_url", "output_url", "download_url", "url", "video")
-        if isinstance(url, str) and url.startswith("http"):
-            return url
-    for key in ("outputs", "videos", "assets"):
-        items = job.get(key) or (job.get("result") or {}).get(key)
-        if isinstance(items, list) and items:
-            first = items[0]
-            url = first if isinstance(first, str) else _first(first, "url", "video_url", "download_url")
-            if isinstance(url, str) and url.startswith("http"):
-                return url
-    return None
+def _progress_note(task: dict) -> str:
+    parts = []
+    progress = task.get("progress")
+    if isinstance(progress, dict) and progress.get("total"):
+        parts.append(f"step {progress.get('current')}/{progress['total']}")
+    if task.get("estimated_remaining_time") is not None:
+        parts.append(f"~{task['estimated_remaining_time']}s left")
+    return f" ({', '.join(parts)})" if parts else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -350,19 +350,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-o", "--output", type=Path,
                    help="output MP4 (default: output/motivation_<timestamp>.mp4)")
     p.add_argument("--clip", type=Path,
-                   help="use this local clip instead of calling Motion AI")
+                   help="use this local clip instead of calling Mootion")
     p.add_argument("--keep-clip", type=Path,
-                   help="also save the raw Motion AI clip here")
+                   help="also save the raw Mootion clip here")
 
-    api = p.add_argument_group("Motion AI")
-    api.add_argument("--api-key", default=os.getenv("MOTION_API_KEY"), help="default: $MOTION_API_KEY")
-    api.add_argument("--api-base", default=os.getenv("MOTION_API_BASE", DEFAULT_API_BASE),
-                     help=f"default: $MOTION_API_BASE or {DEFAULT_API_BASE}")
-    api.add_argument("--prompt", default=os.getenv("MOTION_PROMPT", DEFAULT_PROMPT))
-    api.add_argument("--aspect-ratio", default="9:16", help="e.g. 9:16 (Shorts/Reels), 16:9, 1:1")
-    api.add_argument("--duration", type=int, default=10, help="clip length in seconds")
-    api.add_argument("--poll-interval", type=float, default=5)
-    api.add_argument("--max-wait", type=float, default=900, help="seconds to wait for generation")
+    api = p.add_argument_group("Mootion API")
+    api.add_argument("--api-key", default=os.getenv("MOOTION_API_KEY"), help="default: $MOOTION_API_KEY")
+    api.add_argument("--api-base", default=os.getenv("MOOTION_API_BASE", DEFAULT_API_BASE),
+                     help=f"default: $MOOTION_API_BASE or {DEFAULT_API_BASE}")
+    api.add_argument("--prompt", default=os.getenv("MOOTION_PROMPT", DEFAULT_PROMPT))
+    api.add_argument("--size", choices=VIDEO_SIZES, default="1080x1920",
+                     help="1080x1920 (Shorts/Reels, default), 1920x1080, 1080x1080")
+    api.add_argument("--video-style", default="photorealistic", help="Mootion storyboard style")
+    api.add_argument("--language", default="en-US")
+    api.add_argument("--poll-interval", type=float, default=10)
+    api.add_argument("--max-wait", type=float, default=1800, help="seconds to wait for generation")
 
     style = p.add_argument_group("Style")
     style.add_argument("--font", help="TTF/OTF font file (default: auto-detect a bold sans)")
@@ -397,8 +399,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise PipelineError(f"Clip not found: {args.clip}")
                 clip = args.clip
             else:
-                client = MotionClient(args.api_key, args.api_base)
-                clip = client.generate_clip(args.prompt, args.aspect_ratio, args.duration,
+                client = MootionClient(args.api_key, args.api_base)
+                clip = client.generate_clip(args.prompt, args.size, args.video_style, args.language,
                                             Path(tmp) / "clip.mp4", args.poll_interval, args.max_wait)
                 if args.keep_clip:
                     args.keep_clip.parent.mkdir(parents=True, exist_ok=True)

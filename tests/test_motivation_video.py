@@ -90,27 +90,31 @@ class TextTests(unittest.TestCase):
         self.assertIn("afade=t=out:st=8.000:d=2.0", graph)
 
 
-class JobParsingTests(unittest.TestCase):
-    def test_video_url_shapes(self):
-        cases = [
-            {"status": "completed", "video_url": "https://x/a.mp4"},
-            {"data": {"status": "completed", "output_url": "https://x/a.mp4"}},
-            {"result": {"url": "https://x/a.mp4"}},
-            {"outputs": [{"url": "https://x/a.mp4"}]},
-            {"outputs": ["https://x/a.mp4"]},
-        ]
-        for job in cases:
-            with self.subTest(job=job):
-                self.assertEqual(mv.job_video_url(job), "https://x/a.mp4")
-        self.assertIsNone(mv.job_video_url({"status": "processing"}))
-
+class ClientTests(unittest.TestCase):
     def test_missing_api_key(self):
-        with self.assertRaisesRegex(mv.PipelineError, "MOTION_API_KEY"):
-            mv.MotionClient("")
+        with self.assertRaisesRegex(mv.PipelineError, "MOOTION_API_KEY"):
+            mv.MootionClient("")
+
+    def test_progress_note(self):
+        task = {"progress": {"current": 2, "total": 5}, "estimated_remaining_time": 40}
+        self.assertEqual(mv._progress_note(task), " (step 2/5, ~40s left)")
+        self.assertEqual(mv._progress_note({"progress": None, "estimated_remaining_time": None}), "")
 
 
-class FakeMotionAPI(http.server.BaseHTTPRequestHandler):
-    """Fake API: job is 'processing' on the first poll, 'completed' on the second."""
+TASK_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+
+def task_data(status, video_url=None, failure_reason=None, current=0):
+    """A Text2VideoDataSchema object as defined in docs/mootion-api.json."""
+    return {
+        "id": TASK_ID, "create_time": "2026-10-13T10:00:00Z", "status": status, "type": "text2video",
+        "progress": {"current": current, "total": 3}, "failure_reason": failure_reason,
+        "estimated_remaining_time": 30, "elapsed_total_time": 5, "video_url": video_url,
+    }
+
+
+class FakeMootionAPI(http.server.BaseHTTPRequestHandler):
+    """Fake Mootion API: 'processing' on the first poll, then 'success' (or 'failure')."""
 
     clip_bytes = b""
     polls = 0
@@ -128,31 +132,47 @@ class FakeMotionAPI(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _authorized(self):
+        if self.headers.get("Authorization") != "Bearer test-key":
+            self._json(401, {"detail": "Invalid token"})
+            return False
+        return True
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         type(self).requests.append(("POST", self.path, self.headers.get("Authorization"), body))
-        if self.headers.get("Authorization") != "Bearer test-key":
-            return self._json(401, {"error": "unauthorized"})
-        self._json(200, {"job_id": "job123", "status": "queued"})
+        if self.path != "/api/v1/text2video" or not self._authorized():
+            return None if self.path == "/api/v1/text2video" else self._json(404, {"detail": "Not Found"})
+        if "storyboard" not in body or "prompt" not in body["storyboard"].get("user_input", {}):
+            return self._json(422, {"detail": [{"loc": ["body", "storyboard"], "msg": "Field required",
+                                                "type": "missing"}]})
+        if body.get("size") not in mv.VIDEO_SIZES:
+            return self._json(422, {"detail": [{"loc": ["body", "size"], "msg": "Input should be valid",
+                                                "type": "enum"}]})
+        self._json(200, {"code": 0, "message": "ok", "data": task_data("created")})
 
     def do_GET(self):
         cls = type(self)
         cls.requests.append(("GET", self.path, self.headers.get("Authorization"), None))
-        if self.path == "/api/sessions/job123":
+        if self.path == f"/api/v1/text2video/{TASK_ID}":
+            if not self._authorized():
+                return None
             cls.polls += 1
             if cls.fail:
-                return self._json(200, {"status": "failed", "error": "content policy"})
+                return self._json(200, {"code": 0, "message": "ok",
+                                        "data": task_data("failure", failure_reason={"msg": "content policy"})})
             if cls.polls < 2:
-                return self._json(200, {"status": "processing"})
-            host = self.headers["Host"]
-            return self._json(200, {"status": "completed", "video_url": f"http://{host}/files/clip.mp4"})
+                return self._json(200, {"code": 0, "message": "ok", "data": task_data("processing", current=1)})
+            # Different hostname from the API base (127.0.0.1), like a real storage/CDN link.
+            url = f"http://localhost:{self.server.server_port}/files/clip.mp4"
+            return self._json(200, {"code": 0, "message": "ok", "data": task_data("success", video_url=url, current=3)})
         if self.path == "/files/clip.mp4":
             self.send_response(200)
             self.send_header("Content-Length", str(len(cls.clip_bytes)))
             self.end_headers()
             self.wfile.write(cls.clip_bytes)
-            return
-        self._json(404, {"error": "not found"})
+            return None
+        self._json(404, {"detail": "Not Found"})
 
 
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe not installed")
@@ -167,15 +187,15 @@ class EndToEndTests(unittest.TestCase):
         self.quotes.write_text("Don't stop: it's 100% \"worth\" it, {really} [truly] \\ trust me; keep going\n")
         self.clip = make_clip(self.tmp / "clip.mp4", seconds=3)
 
-        FakeMotionAPI.clip_bytes = self.clip.read_bytes()
-        FakeMotionAPI.polls = 0
-        FakeMotionAPI.fail = False
-        FakeMotionAPI.requests = []
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeMotionAPI)
+        FakeMootionAPI.clip_bytes = self.clip.read_bytes()
+        FakeMootionAPI.polls = 0
+        FakeMootionAPI.fail = False
+        FakeMootionAPI.requests = []
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeMootionAPI)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
-        self.api_base = f"http://127.0.0.1:{self.server.server_port}/api"
+        self.api_base = f"http://127.0.0.1:{self.server.server_port}"
 
     def assert_valid_output(self, path: Path):
         out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
@@ -199,12 +219,13 @@ class EndToEndTests(unittest.TestCase):
         self.assert_valid_output(output)
         self.assertTrue(kept.is_file())
 
-        post = FakeMotionAPI.requests[0]
-        self.assertEqual(post[:3], ("POST", "/api/sessions", "Bearer test-key"))
-        self.assertEqual(post[3]["aspect_ratio"], "9:16")
-        self.assertEqual(FakeMotionAPI.polls, 2)
-        # The API key must not leak to the (non-API) download host path.
-        download = [r for r in FakeMotionAPI.requests if r[1] == "/files/clip.mp4"][0]
+        post = FakeMootionAPI.requests[0]
+        self.assertEqual(post[:3], ("POST", "/api/v1/text2video", "Bearer test-key"))
+        self.assertEqual(post[3], {"size": "1080x1920", "storyboard": {
+            "style": "photorealistic", "user_input": {"prompt": mv.DEFAULT_PROMPT, "language": "en-US"}}})
+        self.assertEqual(FakeMootionAPI.polls, 2)
+        # The API key must not leak to the storage host the clip is downloaded from.
+        download = [r for r in FakeMootionAPI.requests if r[1] == "/files/clip.mp4"][0]
         self.assertIsNone(download[2])
 
     def test_local_clip_skips_api(self):
@@ -213,10 +234,10 @@ class EndToEndTests(unittest.TestCase):
                       "-o", str(output), "--clip", str(self.clip)])
         self.assertEqual(rc, 0)
         self.assert_valid_output(output)
-        self.assertEqual(FakeMotionAPI.requests, [])
+        self.assertEqual(FakeMootionAPI.requests, [])
 
     def test_failed_job_returns_error(self):
-        FakeMotionAPI.fail = True
+        FakeMootionAPI.fail = True
         output = self.tmp / "final.mp4"
         with self.assertLogs("motivation_video", "ERROR") as logs:
             rc = mv.main(["--music-dir", str(self.music), "--quotes", str(self.quotes),
@@ -232,7 +253,12 @@ class EndToEndTests(unittest.TestCase):
                           "-o", str(self.tmp / "f.mp4"), "--api-key", "wrong",
                           "--api-base", self.api_base])
         self.assertEqual(rc, 1)
-        self.assertIn("HTTP 401", "\n".join(logs.output))
+        self.assertIn("HTTP 401: Invalid token", "\n".join(logs.output))
+
+    def test_validation_error_is_readable(self):
+        client = mv.MootionClient("test-key", self.api_base)
+        with self.assertRaisesRegex(mv.PipelineError, "HTTP 422: body.size: Input should be valid"):
+            client.create_task("clouds", "720x1280", "photorealistic", "en-US")
 
     def test_inputs_validated_before_api_call(self):
         empty = self.tmp / "empty"
@@ -241,7 +267,7 @@ class EndToEndTests(unittest.TestCase):
             rc = mv.main(["--music-dir", str(empty), "--quotes", str(self.quotes),
                           "--api-key", "test-key", "--api-base", self.api_base])
         self.assertEqual(rc, 1)
-        self.assertEqual(FakeMotionAPI.requests, [])
+        self.assertEqual(FakeMootionAPI.requests, [])
 
 
 if __name__ == "__main__":
